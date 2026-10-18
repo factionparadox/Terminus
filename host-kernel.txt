@@ -1,0 +1,1 @@
+Linux terminus-station 7.1.5 #1 SMP PREEMPT_DYNAMIC 1 x86_64 GNU/Linux

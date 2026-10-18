@@ -1,0 +1,9 @@
+Generation 1	Jun 19 2026 14:47:56	(current)
+  nonguix bf39542
+    repository URL: https://gitlab.com/nonguix/nonguix
+    branch: master
+    commit: bf39542ca537fde8839b209ac21d6f3254469b15
+  guix 35e88b7
+    repository URL: https://git.guix.gnu.org/guix.git
+    branch: master
+    commit: 35e88b7ff2f9c51cccdb3efac121e1854c4362bd

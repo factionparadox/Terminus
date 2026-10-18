@@ -1,0 +1,1745 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TERM_NAME="Terminus"
+TERM_RELEASE="Hydromel"
+
+CONFIG="${VANIR_CONFIG:-/etc/config.scm}"
+TERM_DIR="${VANIR_DIR:-/etc/terminus}"
+HOME_CONFIG="${VANIR_HOME_CONFIG:-$HOME/.config/terminus/home.scm}"
+BIFROST_FILE="${VANIR_BIFROST_FILE:-$HOME/.config/terminus/bifrost.nix}"
+bifrost_init() {
+  mkdir -p "$(dirname "$BIFROST_FILE")"
+
+  if [ -f "$BIFROST_FILE" ]; then
+    echo "Bifrost file already exists: $BIFROST_FILE"
+    return 0
+  fi
+
+  cat > "$BIFROST_FILE" <<'EOF'
+{ pkgs ? import <nixpkgs> {} }:
+
+with pkgs; [
+  hello
+  fastfetch
+]
+EOF
+
+  echo "Created Bifrost file: $BIFROST_FILE"
+}
+
+bifrost_file() {
+  echo "$BIFROST_FILE"
+  if [ -f "$BIFROST_FILE" ]; then
+    echo
+    cat "$BIFROST_FILE"
+  else
+    echo "Bifrost file does not exist yet."
+    echo "Run: vanir bifrost init"
+  fi
+}
+
+bifrost_edit() {
+  mkdir -p "$(dirname "$BIFROST_FILE")"
+  "${EDITOR:-nano}" "$BIFROST_FILE"
+}
+
+bifrost_apply() {
+  [ -f "$BIFROST_FILE" ] || die "Bifrost file not found: $BIFROST_FILE"
+  need nix-env
+  nix-env -irf "$BIFROST_FILE"
+}
+
+bifrost_sync() {
+  bifrost_update
+  bifrost_apply
+  bifrost_integrate
+}
+
+die() {
+  echo "vanir: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+root_guix() {
+  if [ "$(id -u)" -eq 0 ]; then
+    GUIX_PROFILE="$HOME/.config/guix/current"
+    [ -f "$GUIX_PROFILE/etc/profile" ] && . "$GUIX_PROFILE/etc/profile"
+    hash guix 2>/dev/null || true
+    guix "$@"
+  else
+    sudo -H bash -lc '
+      GUIX_PROFILE="$HOME/.config/guix/current"
+      [ -f "$GUIX_PROFILE/etc/profile" ] && . "$GUIX_PROFILE/etc/profile"
+      hash guix 2>/dev/null || true
+      guix "$@"
+    ' bash "$@"
+  fi
+}
+
+status() {
+  echo "$TERM_NAME $TERM_RELEASE"
+  echo "------------------"
+  printf "%-14s %s\n" "Host:" "$(hostname)"
+  printf "%-14s %s\n" "Kernel:" "$(uname -r)"
+
+  if command -v guix >/dev/null 2>&1; then
+    printf "%-14s %s\n" "Core:" "$(guix --version | head -n1)"
+  else
+    printf "%-14s %s\n" "Core:" "Guix not found"
+  fi
+
+  if command -v nix >/dev/null 2>&1; then
+    printf "%-14s %s\n" "Bifrost:" "$(nix --version)"
+  else
+    printf "%-14s %s\n" "Bifrost:" "not available"
+  fi
+
+  if pgrep -x nix-daemon >/dev/null 2>&1; then
+    printf "%-14s %s\n" "Bifrost svc:" "running"
+  else
+    printf "%-14s %s\n" "Bifrost svc:" "not running"
+  fi
+
+  if command -v nmcli >/dev/null 2>&1; then
+    wifi="$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device | awk -F: '$2=="wifi"{print $1 " " $3 " " $4; exit}')"
+    printf "%-14s %s\n" "Wi-Fi:" "${wifi:-not found}"
+  fi
+
+  if command -v powerprofilesctl >/dev/null 2>&1; then
+    profile="$(powerprofilesctl get 2>/dev/null || true)"
+    printf "%-14s %s\n" "Power:" "${profile:-no power profile daemon}"
+  fi
+
+  if command -v upower >/dev/null 2>&1; then
+    battery="$(upower -d | awk '
+      /state:/ && !s { state=$2; s=1 }
+      /percentage:/ && !p { pct=$2; p=1 }
+      /energy-rate:/ && !r { rate=$2" "$3; r=1 }
+      END {
+        if (pct || state || rate) print pct " " state " (" rate ")"
+      }')"
+    printf "%-14s %s\n" "Battery:" "${battery:-unknown}"
+  fi
+
+  printf "%-14s %s\n" "Root:" "$(df -h / | awk 'NR==2{print $3 " used / " $2 " total (" $5 ")"}')"
+
+  if [ -d /gnu/store ]; then
+    printf "%-14s %s\n" "/gnu/store:" "$(du -sh /gnu/store 2>/dev/null | awk '{print $1}')"
+  fi
+
+  if [ -d /nix/store ]; then
+    printf "%-14s %s\n" "/nix/store:" "$(du -sh /nix/store 2>/dev/null | awk '{print $1}')"
+  fi
+}
+
+describe() {
+  echo "== Terminus core =="
+  root_guix describe || true
+  echo
+
+  echo "== Current system =="
+  root_guix system describe || true
+  echo
+
+  echo "== Bifrost channels =="
+  if command -v nix-channel >/dev/null 2>&1; then
+    nix-channel --list
+  else
+    echo "nix-channel not found"
+  fi
+}
+
+doctor() {
+  status
+  echo
+  echo "== Service checks =="
+
+  if command -v herd >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ]; then
+      herd status nix-daemon 2>/dev/null || true
+    else
+      sudo herd status nix-daemon 2>/dev/null || true
+    fi
+  fi
+
+  echo
+  echo "== Store checks =="
+  [ -d /gnu/store ] && echo "/gnu/store exists"
+  [ -d /nix/store ] && echo "/nix/store exists"
+
+  echo
+  echo "== Network checks =="
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli device
+  else
+    echo "nmcli not found"
+  fi
+}
+
+rebuild() {
+  local cfg="${1:-$CONFIG}"
+  root_guix system reconfigure "$cfg"
+}
+
+pull() {
+  root_guix pull
+}
+
+update() {
+  local all="no"
+
+  if [ "${1:-}" = "--all" ]; then
+    all="yes"
+  fi
+
+  root_guix pull
+  root_guix system reconfigure "$CONFIG"
+
+  if [ "$all" = "yes" ]; then
+    bifrost_update
+  fi
+}
+
+rollback() {
+  root_guix system roll-back
+}
+
+generations() {
+  root_guix system list-generations "$@"
+}
+
+delete_generations() {
+  [ "$#" -gt 0 ] || die "usage: vanir delete-generations PATTERN"
+  root_guix system delete-generations "$@"
+}
+
+home() {
+  local cfg="${1:-$HOME_CONFIG}"
+  [ -f "$cfg" ] || die "home config not found: $cfg"
+  guix home reconfigure "$cfg"
+}
+
+core_search() {
+  [ "$#" -gt 0 ] || die "usage: vanir search PACKAGE"
+  guix search "$@"
+}
+
+core_find() {
+  [ "$#" -gt 0 ] || die "usage: vanir find PACKAGE"
+
+  echo "== Core results =="
+  guix search "$@" || true
+
+  echo
+  echo "== Bifrost results =="
+  bifrost_search "$@" || true
+}
+
+core_install() {
+  [ "$#" -gt 0 ] || die "usage: vanir install PACKAGE..."
+  guix install "$@"
+}
+
+core_remove() {
+  [ "$#" -gt 0 ] || die "usage: vanir remove PACKAGE..."
+  guix remove "$@"
+}
+
+core_upgrade() {
+  guix upgrade "$@"
+}
+
+core_list() {
+  guix package --list-installed
+}
+
+core_shell() {
+  [ "$#" -gt 0 ] || die "usage: vanir shell PACKAGE..."
+  guix shell "$@"
+}
+
+core_run() {
+  [ "$#" -gt 0 ] || die "usage: vanir run PACKAGE [COMMAND...]"
+  local pkg="$1"
+  shift || true
+
+  if [ "$#" -gt 0 ]; then
+    guix shell "$pkg" -- "$@"
+  else
+    guix shell "$pkg" -- "$pkg"
+  fi
+}
+
+core_gc() {
+  root_guix gc "$@"
+}
+
+bifrost_channels() {
+  need nix-channel
+  nix-channel --list
+}
+
+bifrost_update() {
+  need nix-channel
+  nix-channel --update
+}
+
+bifrost_search() {
+  [ "$#" -gt 0 ] || die "usage: vanir bifrost search PACKAGE"
+  need nix-env
+  local q="$*"
+  nix-env -qaP ".*${q}.*"
+}
+
+bifrost_install() {
+  [ "$#" -gt 0 ] || die "usage: vanir bifrost install PACKAGE..."
+  need nix-env
+
+  for pkg in "$@"; do
+    nix-env -iA "nixpkgs.$pkg"
+  done
+}
+
+bifrost_remove() {
+  [ "$#" -gt 0 ] || die "usage: vanir bifrost remove PACKAGE..."
+  need nix-env
+  nix-env -e "$@"
+}
+
+bifrost_upgrade() {
+  need nix-env
+  nix-env -u "$@"
+}
+
+bifrost_list() {
+  need nix-env
+  nix-env -q
+}
+
+bifrost_shell() {
+  [ "$#" -gt 0 ] || die "usage: vanir bifrost shell PACKAGE..."
+  need nix-shell
+  nix-shell -p "$@"
+}
+
+bifrost_run() {
+  [ "$#" -gt 0 ] || die "usage: vanir bifrost run PACKAGE [COMMAND...]"
+  need nix-shell
+
+  local pkg="$1"
+  shift || true
+
+  if [ "$#" -gt 0 ]; then
+    nix-shell -p "$pkg" --run "$*"
+  else
+    nix-shell -p "$pkg" --run "$pkg"
+  fi
+}
+
+bifrost_gc() {
+  need nix-collect-garbage
+  nix-collect-garbage "$@"
+}
+
+bifrost_optimise() {
+  need nix-store
+  nix-store --optimise
+}
+
+gc() {
+  if [ "${1:-}" = "--all" ]; then
+    shift || true
+    core_gc "$@"
+    bifrost_gc "$@"
+  else
+    core_gc "$@"
+  fi
+}
+
+clean() {
+  gc "$@"
+}
+
+runes() {
+  cat <<'EOF'
+Vanir runes — Terminus command reference
+========================================
+
+System
+------
+vanir master file location
+~/.local/bin/vanir
+
+vanir status
+  Show Terminus status: kernel, core, Bifrost, Wi-Fi, power, battery, stores.
+
+vanir doctor
+  Deeper health check: status, services, stores, network devices.
+
+vanir describe
+  Show Guix/Nonguix channels, system generation, and Bifrost channels.
+
+vanir record
+  Record the current Terminus state into a timestamped folder under
+  ~/.config/terminus/records/.
+
+vanir record NAME
+  Record the current Terminus state under a named folder.
+  Example: vanir record hydromel-bifrost-working
+
+vanir rebuild
+  Rebuild Terminus from /etc/config.scm.
+
+vanir rebuild /path/to/config.scm
+  Rebuild Terminus from a specific system config.
+
+vanir starfield
+  Install/update the Terminus login starfield: a GNOME autostart helper
+  that waits for the session to settle, then runs vanir theme repair so
+  the aesthetics of the vessel are reasserted every login.
+
+vanir starfield run
+  Run the Starfield helper immediately.
+
+vanir starfield status
+  Show Starfield autostart state and recent log output.
+
+vanir starfield disable
+  Remove the Starfield login autostart entry.
+
+vanir login-background
+  Install the Terminus GDM pre-login background.
+  Defaults to ~/Pictures/station3.png and writes it to
+  /etc/terminus/login-background.png for the GDM greeter.
+
+vanir login-background /path/to/image.png
+  Install a specific image as the Terminus GDM pre-login background.
+
+vanir theme status
+  Show the active Terminus theme declaration and current GNOME theme settings.
+
+vanir theme init
+  Create ~/.config/terminus/theme.scm with the default pinned theme declaration.
+
+vanir theme edit
+  Edit the declarative Terminus theme file.
+
+vanir theme apply
+  Clone/update the pinned theme repository, install GTK/Shell/icon files,
+  then enforce the full Terminus desktop state.
+
+vanir theme reset
+  Reset GNOME theme settings back to Adwaita defaults.
+
+vanir theme enforce
+  Declaratively assert the full Terminus desktop state: Prism GTK/icon/shell
+  theme, User Themes, Dash-to-Panel, Terminus show-apps icon, Fastfetch wrapper,
+  Ptyxis wrapper/launcher, and login reapply helper.
+
+vanir theme repair
+  Alias for vanir theme enforce.
+
+vanir pull
+  Update Guix/Nonguix channel state.
+
+vanir update
+  Pull Guix/Nonguix and rebuild Terminus.
+
+vanir update --all
+  Pull Guix/Nonguix, rebuild Terminus, and update Bifrost/Nixpkgs.
+
+vanir event one
+  Trigger a full Terminus Event One: record pre-state, serialise unstable
+  Guix user-profile packages into Core, update/rebuild Core, sync Bifrost,
+  remove absorbed user-profile packages after success, integrate launchers,
+  and record the resulting timeline.
+
+vanir event one --gc
+  Run Event One, then garbage collect old Core and Bifrost store paths.
+
+vanir rollback
+  Roll back the Guix system generation.
+
+vanir generations
+  List Guix system generations.
+
+vanir delete-generations PATTERN
+  Delete old Guix system generations matching PATTERN.
+
+vanir home
+  Reconfigure Guix Home using ~/.config/terminus/home.scm.
+
+vanir gc
+  Garbage collect Guix store items.
+
+vanir gc --all
+  Garbage collect Guix and Bifrost store items.
+
+vanir clean
+  Alias for vanir gc.
+
+vanir serialise
+  Serialise Guix user-profile packages into /etc/terminus/serialised-packages.scm.
+
+vanir serialise absorb
+  Serialise Guix user-profile packages, rebuild Terminus, then remove the absorbed
+  packages from the Guix user profile after the rebuild succeeds.
+
+vanir serialise remove-user
+  Remove the last serialised package set from the Guix user profile.
+
+vanir serialise status
+  Show Guix user-profile packages and serialised package file locations.
+
+vanir serialise file
+  Print the generated serialised package Scheme file.
+
+Core
+----
+Core = Guix/Nonguix.
+
+vanir search PACKAGE
+  Search core packages.
+
+vanir find PACKAGE
+  Search both core and Bifrost.
+
+vanir install PACKAGE...
+  Install packages into the Guix user profile.
+
+vanir remove PACKAGE...
+  Remove packages from the Guix user profile.
+
+vanir upgrade
+  Upgrade Guix user profile packages.
+
+vanir list
+  List installed Guix user profile packages.
+
+vanir shell PACKAGE...
+  Enter a temporary Guix shell.
+
+vanir run PACKAGE
+  Run PACKAGE through a temporary Guix shell.
+
+vanir core integrate
+  Integrate Guix user-profile desktop launchers into GNOME.
+  Copies .desktop files from ~/.guix-profile, patches Exec paths,
+  resolves icons, and refreshes the desktop app database.
+
+Bifrost
+-------
+Bifrost = Nixpkgs bridge.
+
+vanir bifrost channels
+  List Bifrost channels.
+
+vanir bifrost update
+  Update Bifrost/Nixpkgs channels.
+
+vanir bifrost search PACKAGE
+  Search Bifrost packages.
+
+vanir bifrost install PACKAGE...
+  Install packages into the Nix user profile.
+
+vanir bifrost remove PACKAGE...
+  Remove packages from the Nix user profile.
+
+vanir bifrost upgrade
+  Upgrade Nix user profile packages.
+
+vanir bifrost list
+  List installed Nix user profile packages.
+
+vanir bifrost shell PACKAGE...
+  Enter a temporary Nix shell.
+
+vanir bifrost run PACKAGE
+  Run PACKAGE through a temporary Nix shell.
+
+vanir bifrost gc
+  Garbage collect old Bifrost store paths.
+
+vanir bifrost optimise
+  Optimise/deduplicate the Nix store.
+
+vanir bifrost init
+  Create ~/.config/terminus/bifrost.nix if it does not exist.
+
+vanir bifrost file
+  Show the Bifrost package file path and contents.
+
+vanir bifrost edit
+  Edit the Bifrost package file.
+
+vanir bifrost apply
+  Apply the Bifrost package file to the Nix user profile.
+
+vanir bifrost sync
+  Update Bifrost/Nixpkgs channels, then apply the Bifrost package file.
+
+Bifrost shorthand
+-----------------
+vanir search bifrost:PACKAGE
+vanir install bifrost:PACKAGE
+vanir remove bifrost:PACKAGE
+vanir shell bifrost:PACKAGE
+vanir run bifrost:PACKAGE
+
+
+Terminology
+-----------
+Terminus
+  The system.
+
+Vanir
+  The operator command.
+
+Core
+  Guix/Nonguix: system spine, services, kernel, firmware, native packages.
+
+Bifrost
+  Nixpkgs bridge: extended package universe and temporary package shells.
+
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+Vanir — Terminus operator
+
+System:
+  vanir status
+  vanir doctor
+  vanir describe
+  vanir record [NAME]
+  vanir rebuild [CONFIG]
+  vanir theme {status|init|edit|apply|reset}
+  vanir theme enforce
+  vanir theme repair
+  vanir pull
+  vanir update
+  vanir update --all
+  vanir rollback
+  vanir generations
+  vanir delete-generations PATTERN
+  vanir home [HOME-CONFIG]
+  vanir gc [OPTIONS]
+  vanir gc --all
+  vanir clean [OPTIONS]
+  vanir serialise {write|absorb|remove-user|status|file}
+
+Core repository:
+  vanir search PACKAGE
+  vanir find PACKAGE
+  vanir install PACKAGE...
+  vanir remove PACKAGE...
+  vanir upgrade [PACKAGE...]
+  vanir list
+  vanir shell PACKAGE...
+  vanir run PACKAGE [COMMAND...]
+  vanir core integrate
+
+Bifrost repository:
+  vanir bifrost channels
+  vanir bifrost update
+  vanir bifrost search PACKAGE
+  vanir bifrost install PACKAGE...
+  vanir bifrost remove PACKAGE...
+  vanir bifrost upgrade [PACKAGE...]
+  vanir bifrost list
+  vanir bifrost shell PACKAGE...
+  vanir bifrost run PACKAGE [COMMAND...]
+  vanir bifrost gc [OPTIONS]
+  vanir bifrost optimise
+
+Prefix shorthand:
+  vanir search bifrost:PACKAGE
+  vanir install bifrost:PACKAGE
+  vanir remove bifrost:PACKAGE
+  vanir shell bifrost:PACKAGE
+  vanir run bifrost:PACKAGE [COMMAND...]
+EOF
+}
+
+
+bifrost_find_icon() {
+  icon="$1"
+
+  [ -z "$icon" ] && return 1
+
+  case "$icon" in
+    /*)
+      [ -f "$icon" ] && printf '%s\n' "$icon"
+      return
+      ;;
+  esac
+
+  {
+    find -L "$HOME/.nix-profile" /nix/store -type f \
+      \( -path "*/share/icons/hicolor/*/apps/$icon.png" \
+         -o -path "*/share/icons/hicolor/*/apps/$icon.svg" \
+         -o -path "*/share/icons/hicolor/*/apps/$icon.svgz" \
+         -o -path "*/share/pixmaps/$icon.png" \
+         -o -path "*/share/pixmaps/$icon.svg" \
+         -o -path "*/share/pixmaps/$icon.xpm" \) \
+      2>/dev/null
+
+    find -L "$HOME/.nix-profile" /nix/store -type f \
+      \( -iname "$icon.png" -o -iname "$icon.svg" -o -iname "$icon.svgz" -o -iname "$icon.xpm" \
+         -o -iname "*$icon*.png" -o -iname "*$icon*.svg" -o -iname "*$icon*.svgz" -o -iname "*$icon*.xpm" \) \
+      2>/dev/null
+  } \
+    | grep -E '/share/(icons|pixmaps)/|/share/.*icons/' \
+    | grep -viE 'tray|symbolic|mono' \
+    | awk '!seen[$0]++' \
+    | sort -Vr \
+    | head -n 1
+}
+bifrost_integrate() {
+  mkdir -p "$HOME/.local/share/applications"
+
+  if [ ! -d "$HOME/.nix-profile/share/applications" ]; then
+    die "Bifrost applications directory not found"
+  fi
+
+  for f in "$HOME"/.nix-profile/share/applications/*.desktop; do
+    [ -e "$f" ] || continue
+
+    out="$HOME/.local/share/applications/$(basename "$f")"
+
+    rm -f "$out"
+    cp -L "$f" "$out"
+
+    sed -i '/^TryExec=/d' "$out"
+    sed -i "s|^Exec=|Exec=env PATH=$HOME/.nix-profile/bin:$HOME/.local/bin:$HOME/.guix-profile/bin:/run/current-system/profile/bin:/usr/bin:/bin |" "$out"
+
+    icon="$(grep -m1 '^Icon=' "$out" | cut -d= -f2-)"
+    icon_path="$(bifrost_find_icon "$icon" || true)"
+
+    if [ -n "$icon_path" ]; then
+      sed -i "s|^Icon=.*|Icon=$icon_path|" "$out"
+    fi
+  done
+
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+
+  echo "Bifrost desktop launchers integrated."
+  echo "GNOME should show Bifrost apps after logging out/in or rebooting."
+}
+
+record() {
+  name="${1:-$(date +%Y%m%d-%H%M%S)}"
+  safe_name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '-')"
+  dir="$HOME/.config/terminus/records/$safe_name"
+
+  mkdir -p "$dir"
+
+  echo "Recording Terminus state: $dir"
+
+  cp "$0" "$dir/vanir" 2>/dev/null || true
+
+  [ -f "$CONFIG" ] && cp "$CONFIG" "$dir/config.scm" 2>/dev/null || true
+  [ -f "$BIFROST_FILE" ] && cp "$BIFROST_FILE" "$dir/bifrost.nix" 2>/dev/null || true
+  [ -f "$HOME/.config/fastfetch/config.jsonc" ] && cp "$HOME/.config/fastfetch/config.jsonc" "$dir/fastfetch-config.jsonc" 2>/dev/null || true
+
+  guix describe > "$dir/guix-describe-user.txt" 2>/dev/null || true
+  nix-channel --list > "$dir/bifrost-channels.txt" 2>/dev/null || true
+  vanir bifrost list > "$dir/bifrost-installed.txt" 2>/dev/null || true
+  vanir status > "$dir/status.txt" 2>/dev/null || true
+
+  if command -v fastfetch >/dev/null 2>&1; then
+    fastfetch > "$dir/fastfetch.txt" 2>/dev/null || true
+  fi
+
+  echo "Record written:"
+  echo "$dir"
+}
+
+core_find_icon() {
+  icon="$1"
+
+  [ -z "$icon" ] && return 1
+
+  case "$icon" in
+    /*)
+      [ -f "$icon" ] && printf '%s\n' "$icon"
+      return
+      ;;
+  esac
+
+  {
+    find -L "$HOME/.guix-profile" /run/current-system/profile /gnu/store -type f \
+      \( -path "*/share/icons/hicolor/*/apps/$icon.png" \
+         -o -path "*/share/icons/hicolor/*/apps/$icon.svg" \
+         -o -path "*/share/icons/hicolor/*/apps/$icon.svgz" \
+         -o -path "*/share/pixmaps/$icon.png" \
+         -o -path "*/share/pixmaps/$icon.svg" \
+         -o -path "*/share/pixmaps/$icon.xpm" \) \
+      2>/dev/null
+
+    find -L "$HOME/.guix-profile" /run/current-system/profile /gnu/store -type f \
+      \( -iname "$icon.png" -o -iname "$icon.svg" -o -iname "$icon.svgz" -o -iname "$icon.xpm" \
+         -o -iname "*$icon*.png" -o -iname "*$icon*.svg" -o -iname "*$icon*.svgz" -o -iname "*$icon*.xpm" \) \
+      2>/dev/null
+  } \
+    | grep -E '/share/(icons|pixmaps)/|/share/.*icons/' \
+    | grep -viE 'tray|symbolic|mono' \
+    | awk '!seen[$0]++' \
+    | sort -Vr \
+    | head -n 1
+}
+
+core_integrate() {
+  mkdir -p "$HOME/.local/share/applications"
+
+  if [ ! -d "$HOME/.guix-profile/share/applications" ]; then
+    echo "No Core user application launchers found in ~/.guix-profile/share/applications"
+    return 0
+  fi
+
+  for f in "$HOME"/.guix-profile/share/applications/*.desktop; do
+    [ -e "$f" ] || continue
+
+    out="$HOME/.local/share/applications/$(basename "$f")"
+
+    rm -f "$out"
+    cp -L "$f" "$out"
+
+    sed -i '/^TryExec=/d' "$out"
+    sed -i "s|^Exec=|Exec=env PATH=$HOME/.guix-profile/bin:$HOME/.local/bin:/run/current-system/profile/bin:$HOME/.nix-profile/bin:/usr/bin:/bin |" "$out"
+
+    icon="$(grep -m1 '^Icon=' "$out" | cut -d= -f2-)"
+    icon_path="$(core_find_icon "$icon" || true)"
+
+    if [ -n "$icon_path" ]; then
+      sed -i "s|^Icon=.*|Icon=$icon_path|" "$out"
+    fi
+  done
+
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+
+  echo "Core desktop launchers integrated."
+  echo "GNOME should show Core user apps after logging out/in or rebooting."
+}
+
+THEME_CONFIG="$HOME/.config/terminus/theme.scm"
+
+theme_value() {
+  key="$1"
+
+  [ -f "$THEME_CONFIG" ] || die "theme config not found: $THEME_CONFIG"
+
+  TERMINUS_THEME_KEY="$key" TERMINUS_THEME_FILE="$THEME_CONFIG" guile -c '
+(define file (getenv "TERMINUS_THEME_FILE"))
+(define key (string->symbol (getenv "TERMINUS_THEME_KEY")))
+(define cfg (call-with-input-file file read))
+(define pair (assoc key cfg))
+(if pair
+    (let ((value (cdr pair)))
+      (cond
+       ((string? value) (display value))
+       ((boolean? value) (display (if value "#t" "#f")))
+       (else (write value)))))
+'
+}
+
+theme_init() {
+  mkdir -p "$HOME/.config/terminus"
+
+  if [ -f "$THEME_CONFIG" ]; then
+    echo "Theme config already exists:"
+    echo "  $THEME_CONFIG"
+    return 0
+  fi
+
+  cat > "$THEME_CONFIG" <<'EOF'
+((name . "gnome-prism")
+ (repo . "https://github.com/zachfeldman/gnome-prism.git")
+ (commit . "9380959")
+ (gtk-theme . "gnome-prism")
+ (shell-theme . "gnome-prism")
+ (icon-theme . "gnome-prism")
+ (dark . #t))
+EOF
+
+  echo "Theme config written:"
+  echo "  $THEME_CONFIG"
+}
+
+theme_apply() {
+  command -v git >/dev/null 2>&1 || die "git is not installed"
+  command -v gsettings >/dev/null 2>&1 || die "gsettings is not available"
+  command -v guile >/dev/null 2>&1 || die "guile is not available"
+
+  name="$(theme_value name)"
+  repo="$(theme_value repo)"
+  commit="$(theme_value commit)"
+  gtk_theme="$(theme_value gtk-theme)"
+  shell_theme="$(theme_value shell-theme)"
+  icon_theme="$(theme_value icon-theme)"
+  dark="$(theme_value dark)"
+
+  [ -n "$name" ] || die "theme name missing"
+  [ -n "$repo" ] || die "theme repo missing"
+  [ -n "$commit" ] || die "theme commit missing"
+
+  src="$HOME/.local/share/terminus/themes/$name"
+
+  mkdir -p "$HOME/.local/share/terminus/themes"
+  mkdir -p "$HOME/.local/share/themes"
+  mkdir -p "$HOME/.local/share/icons"
+  mkdir -p "$HOME/.config/gtk-4.0"
+
+  if [ -d "$src/.git" ]; then
+    echo "Updating theme source: $src"
+    git -C "$src" fetch --all --tags
+  else
+    rm -rf "$src"
+    echo "Cloning theme source:"
+    echo "  $repo"
+    git clone "$repo" "$src"
+  fi
+
+  echo "Checking out pinned commit:"
+  echo "  $commit"
+  git -C "$src" checkout "$commit"
+
+  if [ -d "$src/themes/$gtk_theme" ]; then
+    rm -rf "$HOME/.local/share/themes/$gtk_theme"
+    cp -r "$src/themes/$gtk_theme" "$HOME/.local/share/themes/"
+    echo "Installed GTK theme: $gtk_theme"
+  else
+    echo "GTK theme directory not found: $src/themes/$gtk_theme"
+  fi
+
+  if [ -d "$src/icons/$icon_theme" ]; then
+    rm -rf "$HOME/.local/share/icons/$icon_theme"
+    cp -r "$src/icons/$icon_theme" "$HOME/.local/share/icons/"
+    echo "Installed icon theme: $icon_theme"
+    gtk-update-icon-cache -f "$HOME/.local/share/icons/$icon_theme" 2>/dev/null || true
+  else
+    echo "Icon theme directory not found: $src/icons/$icon_theme"
+  fi
+
+  if [ -d "$src/themes/$gtk_theme/gtk-4.0" ]; then
+    cp -r "$src/themes/$gtk_theme/gtk-4.0/"* "$HOME/.config/gtk-4.0/" 2>/dev/null || true
+    echo "Installed GTK4/libadwaita CSS"
+  fi
+
+  if [ "$dark" = "#t" ]; then
+    gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'
+  fi
+
+  [ -n "$gtk_theme" ] && gsettings set org.gnome.desktop.interface gtk-theme "$gtk_theme"
+  [ -n "$icon_theme" ] && gsettings set org.gnome.desktop.interface icon-theme "$icon_theme"
+
+  if command -v gnome-extensions >/dev/null 2>&1; then
+    gnome-extensions enable user-theme@gnome-shell-extensions.gcampax.github.com 2>/dev/null || true
+  fi
+
+  [ -n "$shell_theme" ] && gsettings set org.gnome.shell.extensions.user-theme name "$shell_theme" 2>/dev/null || true
+
+  echo
+  echo "Theme applied."
+  echo "Log out and back in to reload GNOME Shell on Wayland."
+}
+
+theme_status() {
+  echo "Terminus theme"
+  echo "--------------"
+
+  if [ -f "$THEME_CONFIG" ]; then
+    echo "Config:       $THEME_CONFIG"
+    echo "Name:         $(theme_value name)"
+    echo "Repo:         $(theme_value repo)"
+    echo "Commit:       $(theme_value commit)"
+  else
+    echo "Config:       missing"
+  fi
+
+  echo
+  echo "GNOME settings"
+  echo "--------------"
+  gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null || true
+  gsettings get org.gnome.desktop.interface icon-theme 2>/dev/null || true
+  gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null || true
+  gsettings get org.gnome.shell.extensions.user-theme name 2>/dev/null || true
+}
+
+theme_reset() {
+  gsettings set org.gnome.desktop.interface gtk-theme 'Adwaita' 2>/dev/null || true
+  gsettings set org.gnome.desktop.interface icon-theme 'Adwaita' 2>/dev/null || true
+  gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' 2>/dev/null || true
+  gsettings set org.gnome.shell.extensions.user-theme name '' 2>/dev/null || true
+
+  echo "Theme reset to Adwaita defaults."
+  echo "Log out and back in to fully reload GNOME Shell."
+}
+
+SERIALISE_SYSTEM_FILE="/etc/terminus/serialised-packages.scm"
+SERIALISE_USER_COPY="$HOME/.config/terminus/serialised-packages.scm"
+SERIALISE_USER_LIST="$HOME/.config/terminus/serialised-packages.list"
+
+vanir_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif [ -x /run/privileged/bin/sudo ]; then
+    /run/privileged/bin/sudo "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+serialise_collect_user_packages() {
+  guix package --list-installed \
+    | awk 'NF { print $1 }' \
+    | sort -u
+}
+
+serialise_write() {
+  command -v guix >/dev/null 2>&1 || die "guix is not available"
+
+  mkdir -p "$HOME/.config/terminus"
+
+  serialise_collect_user_packages > "$SERIALISE_USER_LIST"
+
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' RETURN
+
+  {
+    echo ";; -*- scheme -*-"
+    echo ";; Generated by Vanir."
+    echo ";; Source: Guix user profile package specifications."
+    echo ";; Regenerate with: vanir serialise"
+    echo
+    echo "(use-modules (gnu packages))"
+    echo
+    echo "(define terminus-serialised-package-specifications"
+    echo "  '("
+
+    sed 's/\\/\\\\/g; s/"/\\"/g; s/.*/    "&"/' "$SERIALISE_USER_LIST"
+
+    echo "    ))"
+    echo
+    echo "(define terminus-serialised-packages"
+    echo "  (specifications->packages terminus-serialised-package-specifications))"
+  } > "$tmp"
+
+  cp "$tmp" "$SERIALISE_USER_COPY"
+
+  vanir_root mkdir -p /etc/terminus
+  vanir_root install -m 0644 "$tmp" "$SERIALISE_SYSTEM_FILE"
+
+  echo "Serialised Guix user-profile packages into:"
+  echo "  $SERIALISE_SYSTEM_FILE"
+  echo
+  echo "User copy:"
+  echo "  $SERIALISE_USER_COPY"
+}
+
+serialise_remove_user_packages() {
+  if [ ! -s "$SERIALISE_USER_LIST" ]; then
+    echo "No serialised Guix user-profile packages to remove."
+    return 0
+  fi
+
+  echo "Removing absorbed packages from Guix user profile..."
+
+  pkgs="$(tr '\n' ' ' < "$SERIALISE_USER_LIST")"
+
+  if [ -n "$pkgs" ]; then
+    guix remove $pkgs
+  fi
+
+  echo
+  echo "Absorbed packages removed from Guix user profile."
+  echo "Run 'vanir gc' later to actually free old store paths."
+}
+
+serialise_absorb() {
+  serialise_write
+
+  echo
+  echo "Rebuilding Terminus with serialised packages..."
+  "$0" rebuild
+
+  echo
+  echo "Rebuild succeeded. Removing serialised packages from Guix user profile..."
+  serialise_remove_user_packages
+
+  echo
+  echo "Serialise absorb complete."
+}
+
+serialise_status() {
+  echo "Vanir serialise"
+  echo "---------------"
+
+  echo
+  echo "Guix user-profile packages:"
+  serialise_collect_user_packages | sed 's/^/  /'
+
+  echo
+  echo "System file:"
+  if [ -f "$SERIALISE_SYSTEM_FILE" ]; then
+    echo "  $SERIALISE_SYSTEM_FILE"
+  else
+    echo "  missing: $SERIALISE_SYSTEM_FILE"
+  fi
+
+  echo
+  echo "User copy:"
+  if [ -f "$SERIALISE_USER_COPY" ]; then
+    echo "  $SERIALISE_USER_COPY"
+  else
+    echo "  missing: $SERIALISE_USER_COPY"
+  fi
+
+  echo
+  echo "Last serialised package list:"
+  if [ -f "$SERIALISE_USER_LIST" ]; then
+    sed 's/^/  /' "$SERIALISE_USER_LIST"
+  else
+    echo "  missing: $SERIALISE_USER_LIST"
+  fi
+}
+
+serialise_file() {
+  if [ -f "$SERIALISE_USER_COPY" ]; then
+    cat "$SERIALISE_USER_COPY"
+  elif [ -f "$SERIALISE_SYSTEM_FILE" ]; then
+    cat "$SERIALISE_SYSTEM_FILE"
+  else
+    die "no serialised package file found"
+  fi
+}
+
+THEME_NAME="gnome-prism"
+THEME_DIR="$HOME/.local/share/terminus/themes/gnome-prism"
+TERMINUS_ICON_DIR="$HOME/.local/share/terminus/icons"
+TERMINUS_SHOW_APPS_ICON="$TERMINUS_ICON_DIR/terminus-show-apps.svg"
+DTP_EXT="dash-to-panel@jderose9.github.com"
+
+theme_write_show_apps_icon() {
+  mkdir -p "$TERMINUS_ICON_DIR"
+
+  cat > "$TERMINUS_SHOW_APPS_ICON" <<'EOF'
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect x="0" y="0" width="64" height="64" fill="#BDA7F0"/>
+  <g fill="none" stroke="#000000" stroke-width="2">
+    <circle cx="32" cy="32" r="6"/>
+    <circle cx="32" cy="32" r="12"/>
+    <circle cx="32" cy="32" r="18"/>
+    <circle cx="32" cy="32" r="24"/>
+  </g>
+</svg>
+EOF
+}
+
+theme_find_dash_to_panel() {
+  find -L \
+    "$HOME/.local/share/gnome-shell/extensions" \
+    /run/current-system/profile \
+    "$HOME/.guix-profile" \
+    "$HOME/.nix-profile" \
+    /gnu/store \
+    -path "*/share/gnome-shell/extensions/$DTP_EXT" \
+    -type d 2>/dev/null | head -n1
+}
+
+theme_restore_dash_to_panel() {
+  mkdir -p "$HOME/.local/share/gnome-shell/extensions"
+
+  if gnome-extensions list 2>/dev/null | grep -qx "$DTP_EXT"; then
+    return 0
+  fi
+
+  src="$(theme_find_dash_to_panel)"
+
+  if [ -z "$src" ]; then
+    echo "Dash-to-Panel not found in any profile/store."
+    echo "Make sure this package is declarative:"
+    echo "  gnome-shell-extension-dash-to-panel"
+    return 1
+  fi
+
+  echo "Restoring Dash-to-Panel extension:"
+  echo "  $src"
+
+  rm -rf "$HOME/.local/share/gnome-shell/extensions/$DTP_EXT"
+  cp -rL "$src" "$HOME/.local/share/gnome-shell/extensions/$DTP_EXT"
+  chmod -R u+rwX "$HOME/.local/share/gnome-shell/extensions/$DTP_EXT"
+}
+
+theme_apply_gnome_settings() {
+  gsettings set org.gnome.desktop.interface gtk-theme "$THEME_NAME" 2>/dev/null || true
+  gsettings set org.gnome.desktop.interface icon-theme "$THEME_NAME" 2>/dev/null || true
+  gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' 2>/dev/null || true
+  gsettings set org.gnome.shell.extensions.user-theme name "$THEME_NAME" 2>/dev/null || true
+
+  gnome-extensions enable user-theme@gnome-shell-extensions.gcampax.github.com 2>/dev/null || true
+
+  gnome-extensions disable dash-to-dock@micxgx.gmail.com 2>/dev/null || true
+  gnome-extensions disable ubuntu-dock@ubuntu.com 2>/dev/null || true
+}
+
+theme_apply_dash_to_panel_settings() {
+  gnome-extensions enable "$DTP_EXT" 2>/dev/null || true
+
+  if command -v dconf >/dev/null 2>&1; then
+    dconf write /org/gnome/shell/extensions/dash-to-panel/show-apps-icon-file \
+      "'$TERMINUS_SHOW_APPS_ICON'" 2>/dev/null || true
+
+    dconf write /org/gnome/shell/extensions/dash-to-panel/show-apps-icon-side-padding 8 2>/dev/null || true
+  fi
+}
+
+theme_write_fastfetch_wrapper() {
+  mkdir -p "$HOME/.local/bin"
+
+  cat > "$HOME/.local/bin/fastfetch" <<'EOF'
+#!/usr/bin/env bash
+
+config="$HOME/.config/fastfetch/config.jsonc"
+
+for real_fastfetch in \
+  "/run/current-system/profile/bin/fastfetch" \
+  "$HOME/.guix-profile/bin/fastfetch" \
+  "$HOME/.nix-profile/bin/fastfetch"
+do
+  if [ -x "$real_fastfetch" ]; then
+    exec "$real_fastfetch" --config "$config" "$@"
+  fi
+done
+
+echo "fastfetch backend not found." >&2
+echo "Checked:" >&2
+echo "  /run/current-system/profile/bin/fastfetch" >&2
+echo "  $HOME/.guix-profile/bin/fastfetch" >&2
+echo "  $HOME/.nix-profile/bin/fastfetch" >&2
+echo >&2
+echo "Fix declaratively with:" >&2
+echo "  add fastfetch to /etc/terminus/serialised-packages.scm" >&2
+echo "  vanir rebuild" >&2
+exit 127
+EOF
+
+  chmod +x "$HOME/.local/bin/fastfetch"
+}
+
+theme_write_ptyxis_wrapper() {
+  mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+
+  cat > "$HOME/.local/bin/ptyxis" <<'EOF'
+#!/usr/bin/env bash
+
+for real_ptyxis in \
+  "$HOME/.nix-profile/bin/ptyxis" \
+  "$HOME/.guix-profile/bin/ptyxis" \
+  "/run/current-system/profile/bin/ptyxis"
+do
+  if [ -x "$real_ptyxis" ]; then
+    exec env \
+      LANG="${LANG:-en_GB.UTF-8}" \
+      LC_ALL="${LC_ALL:-en_GB.UTF-8}" \
+      FONTCONFIG_FILE="/run/current-system/profile/etc/fonts/fonts.conf" \
+      XDG_DATA_DIRS="$HOME/.local/share:$HOME/.nix-profile/share:$HOME/.guix-profile/share:/run/current-system/profile/share:${XDG_DATA_DIRS:-}" \
+      "$real_ptyxis" "$@"
+  fi
+done
+
+echo "Ptyxis backend not found." >&2
+exit 127
+EOF
+
+  chmod +x "$HOME/.local/bin/ptyxis"
+
+  rm -f "$HOME/.local/share/applications/org.gnome.Ptyxis.desktop"
+  cat > "$HOME/.local/share/applications/org.gnome.Ptyxis.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Ptyxis
+GenericName=Terminal
+Comment=Terminal for GNOME
+Exec=/home/lazar/.local/bin/ptyxis
+Icon=org.gnome.Ptyxis
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupNotify=true
+DBusActivatable=false
+EOF
+
+  chmod 644 "$HOME/.local/share/applications/org.gnome.Ptyxis.desktop"
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+}
+
+theme_write_login_apply() {
+  mkdir -p "$HOME/.local/bin" "$HOME/.config/autostart"
+
+  cat > "$HOME/.local/bin/terminus-desktop-apply" <<EOF
+#!/usr/bin/env bash
+sleep 2
+
+gsettings set org.gnome.desktop.interface gtk-theme '$THEME_NAME' 2>/dev/null || true
+gsettings set org.gnome.desktop.interface icon-theme '$THEME_NAME' 2>/dev/null || true
+gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' 2>/dev/null || true
+gsettings set org.gnome.shell.extensions.user-theme name '$THEME_NAME' 2>/dev/null || true
+
+gnome-extensions enable user-theme@gnome-shell-extensions.gcampax.github.com 2>/dev/null || true
+gnome-extensions enable $DTP_EXT 2>/dev/null || true
+
+dconf write /org/gnome/shell/extensions/dash-to-panel/show-apps-icon-file "'$TERMINUS_SHOW_APPS_ICON'" 2>/dev/null || true
+dconf write /org/gnome/shell/extensions/dash-to-panel/show-apps-icon-side-padding 8 2>/dev/null || true
+EOF
+
+  chmod +x "$HOME/.local/bin/terminus-desktop-apply"
+
+  cat > "$HOME/.config/autostart/terminus-desktop-apply.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Terminus Desktop Apply
+Exec=/home/lazar/.local/bin/terminus-desktop-apply
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+}
+
+theme_enforce() {
+  echo "== Vanir theme enforce =="
+  echo "Asserting complete Terminus desktop state."
+  echo
+
+  echo "== Writing Terminus show-apps icon =="
+  theme_write_show_apps_icon
+
+  echo "== Applying GNOME Prism settings =="
+  theme_apply_gnome_settings
+
+  echo "== Restoring Dash-to-Panel if needed =="
+  theme_restore_dash_to_panel || true
+
+  echo "== Applying Dash-to-Panel settings =="
+  theme_apply_dash_to_panel_settings
+
+  echo "== Repairing Fastfetch wrapper =="
+  theme_write_fastfetch_wrapper
+
+  echo "== Preserving canonical Fastfetch skull =="
+  mkdir -p "$HOME/.config/terminus/fastfetch"
+  [ -f "$HOME/.config/terminus/fastfetch/terminus-skull.canonical.ansi" ] && cp "$HOME/.config/terminus/fastfetch/terminus-skull.canonical.ansi" "$HOME/.config/terminus/fastfetch/terminus-skull.ansi"
+
+  echo "== Repairing Ptyxis wrapper and launcher =="
+  theme_write_ptyxis_wrapper
+
+  echo "== Installing login reapply helper =="
+  theme_write_login_apply
+
+  echo
+  echo "== Theme state =="
+  echo "GTK theme:      $(gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null || true)"
+  echo "Icon theme:     $(gsettings get org.gnome.desktop.interface icon-theme 2>/dev/null || true)"
+  echo "Show apps icon: $(dconf read /org/gnome/shell/extensions/dash-to-panel/show-apps-icon-file 2>/dev/null || true)"
+  echo
+  echo "Enabled extensions:"
+  gnome-extensions list --enabled 2>/dev/null | grep -Ei 'dash|panel|user-theme' || true
+  echo
+  echo "Done. If Dash-to-Panel was restored from store, log out/in once."
+}
+
+login_background() {
+  wall="${1:-$HOME/Pictures/station3.png}"
+
+  [ -f "$wall" ] || die "login background not found: $wall"
+
+  echo "== Vanir login background =="
+  echo "Installing GDM background:"
+  echo "$wall"
+
+  sudo install -Dm644 "$wall" /etc/terminus/login-background.png
+  sudo mkdir -p /etc/dconf/profile /etc/dconf/db/gdm.d
+
+  printf "%s\n" \
+    "user-db:user" \
+    "system-db:gdm" \
+    | sudo tee /etc/dconf/profile/gdm >/dev/null
+
+  {
+    printf "%s\n" "[org/gnome/desktop/background]"
+    printf "%s\n" "picture-uri='file:///etc/terminus/login-background.png'"
+    printf "%s\n" "picture-uri-dark='file:///etc/terminus/login-background.png'"
+    printf "%s\n" "picture-options='zoom'"
+    printf "%s\n" "primary-color='#000000'"
+    printf "%s\n" "secondary-color='#000000'"
+  } | sudo tee /etc/dconf/db/gdm.d/00-terminus-login-background >/dev/null
+
+  if command -v dconf >/dev/null 2>&1; then
+    sudo "$(command -v dconf)" update
+  else
+    sudo dconf update
+  fi
+
+  echo "GDM login background installed:"
+  echo "/etc/terminus/login-background.png"
+  echo "Reboot to see it before login."
+}
+
+cmd="${1:-}"
+[ -n "$cmd" ] || { usage; exit 0; }
+shift || true
+
+event_one() {
+  do_gc=0
+
+  case "${1:-}" in
+    --gc)
+      do_gc=1
+      shift
+      ;;
+    "")
+      ;;
+    *)
+      die "usage: vanir event one [--gc]"
+      ;;
+  esac
+
+  stamp="$(date +%Y%m%d-%H%M%S)"
+
+  echo "== Vanir Event One =="
+  echo "Unstable matter will be serialised into Core."
+  echo "A pre-event record will be created before the timeline is altered."
+  echo
+
+  echo "== Recording pre-event state =="
+  "$0" record "pre-event-one-$stamp" || true
+  echo
+
+  echo "== Serialising Guix user-profile packages =="
+  "$0" serialise write
+  echo
+
+  echo "== Updating Core and Bifrost =="
+  echo "Running: vanir update --all"
+  echo
+
+  if ! "$0" update --all; then
+    echo
+    echo "Event One failed during update/rebuild."
+    echo "User-profile packages have NOT been removed."
+    return 1
+  fi
+
+  echo
+  echo "== Removing absorbed Guix user-profile packages =="
+  "$0" serialise remove-user
+  echo
+
+  echo "== Re-integrating Core launchers =="
+  "$0" core integrate || true
+  echo
+
+  echo "== Recording post-event state =="
+  "$0" record "post-event-one-$stamp" || true
+  echo
+
+  if [ "$do_gc" -eq 1 ]; then
+    echo "== Garbage collecting Core and Bifrost stores =="
+    "$0" gc --all
+    echo
+  else
+    echo "Skipping garbage collection."
+    echo "Run later if wanted: vanir gc --all"
+    echo
+  fi
+
+  echo "Event One complete."
+}
+
+starfield() {
+  mode="${1:-install}"
+
+  STAR_BIN="$HOME/.local/bin/terminus-starfield"
+  STAR_DESKTOP="$HOME/.config/autostart/terminus-starfield.desktop"
+  STAR_LOG="$HOME/.cache/terminus/starfield.log"
+
+  case "$mode" in
+    install|apply)
+      mkdir -p "$HOME/.local/bin" "$HOME/.config/autostart" "$HOME/.cache/terminus"
+
+      cat > "$STAR_BIN" <<'STARFIELD'
+#!/usr/bin/env bash
+set -u
+
+LOG="$HOME/.cache/terminus/starfield.log"
+
+{
+  echo "== Vanir Starfield =="
+  date
+  echo "Waiting for GNOME session to settle..."
+
+  sleep "${TERMINUS_STARFIELD_DELAY:-8}"
+
+  echo
+  echo "Applying aesthetics of the vessel."
+  echo "Running: vanir theme repair"
+
+  if [ -x "$HOME/.local/bin/vanir" ]; then
+    "$HOME/.local/bin/vanir" theme repair
+  else
+    echo "vanir not found at $HOME/.local/bin/vanir"
+  fi
+
+  echo
+  echo "Starfield complete."
+  date
+  echo
+} >> "$LOG" 2>&1
+STARFIELD
+
+      chmod +x "$STAR_BIN"
+
+      cat > "$STAR_DESKTOP" <<STARFIELD_DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Vanir Starfield
+Comment=Apply the aesthetics of the Terminus vessel at login
+Exec=$STAR_BIN
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
+STARFIELD_DESKTOP
+
+      echo "== Vanir Starfield =="
+      echo "Login starfield installed."
+      echo "Autostart: $STAR_DESKTOP"
+      echo "Helper:    $STAR_BIN"
+      echo "Log:       $STAR_LOG"
+      echo
+      echo "Running starfield once now."
+      "$STAR_BIN"
+      ;;
+
+    run)
+      if [ -x "$STAR_BIN" ]; then
+        "$STAR_BIN"
+      else
+        die "starfield is not installed; run: vanir starfield"
+      fi
+      ;;
+
+    status)
+      echo "== Vanir Starfield status =="
+      if [ -f "$STAR_DESKTOP" ]; then
+        echo "Autostart installed: $STAR_DESKTOP"
+      else
+        echo "Autostart not installed."
+      fi
+
+      if [ -x "$STAR_BIN" ]; then
+        echo "Helper installed: $STAR_BIN"
+      else
+        echo "Helper not installed."
+      fi
+
+      if [ -f "$STAR_LOG" ]; then
+        echo
+        echo "Recent starfield log:"
+        tail -40 "$STAR_LOG"
+      fi
+      ;;
+
+    disable)
+      rm -f "$STAR_DESKTOP"
+      echo "Vanir Starfield autostart disabled."
+      ;;
+
+    *)
+      die "usage: vanir starfield [install|run|status|disable]"
+      ;;
+  esac
+}
+
+case "$cmd" in
+  login-background)
+    login_background "$@"
+    ;;
+  starfield)
+    starfield "$@"
+    ;;
+  event)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      one) event_one "$@" ;;
+      *) die "usage: vanir event one [--gc]" ;;
+    esac
+    ;;
+  status) status ;;
+  record) record "$@" ;;
+  doctor) doctor ;;
+  describe) describe ;;
+  rebuild) rebuild "$@" ;;
+  pull) pull ;;
+  update) update "$@" ;;
+  rollback) rollback ;;
+  generations) generations "$@" ;;
+  delete-generations) delete_generations "$@" ;;
+  home) home "$@" ;;
+  gc) gc "$@" ;;
+  clean) clean "$@" ;;
+  runes) runes ;;
+
+  search)
+    [ "$#" -gt 0 ] || die "usage: vanir search PACKAGE"
+    if [[ "${1:-}" == bifrost:* ]]; then
+      bifrost_search "${1#bifrost:}"
+    else
+      core_search "$@"
+    fi
+    ;;
+
+  find)
+    core_find "$@"
+    ;;
+
+  install)
+    [ "$#" -gt 0 ] || die "usage: vanir install PACKAGE..."
+    if [[ "${1:-}" == bifrost:* ]]; then
+      first="${1#bifrost:}"
+      shift || true
+      bifrost_install "$first" "$@"
+    else
+      core_install "$@"
+    fi
+    ;;
+
+  remove)
+    [ "$#" -gt 0 ] || die "usage: vanir remove PACKAGE..."
+    if [[ "${1:-}" == bifrost:* ]]; then
+      first="${1#bifrost:}"
+      shift || true
+      bifrost_remove "$first" "$@"
+    else
+      core_remove "$@"
+    fi
+    ;;
+
+  upgrade)
+    core_upgrade "$@"
+    ;;
+
+  list)
+    core_list
+    ;;
+
+  shell)
+    [ "$#" -gt 0 ] || die "usage: vanir shell PACKAGE..."
+    if [[ "${1:-}" == bifrost:* ]]; then
+      first="${1#bifrost:}"
+      shift || true
+      bifrost_shell "$first" "$@"
+    else
+      core_shell "$@"
+    fi
+    ;;
+
+  run)
+    [ "$#" -gt 0 ] || die "usage: vanir run PACKAGE [COMMAND...]"
+    if [[ "${1:-}" == bifrost:* ]]; then
+      first="${1#bifrost:}"
+      shift || true
+      bifrost_run "$first" "$@"
+    else
+      core_run "$@"
+    fi
+    ;;
+
+  serialise|serialize)
+    sub="${1:-write}"
+    shift || true
+
+    case "$sub" in
+      write|"") serialise_write ;;
+      absorb) serialise_absorb ;;
+      remove-user) serialise_remove_user_packages ;;
+      status) serialise_status ;;
+      file) serialise_file ;;
+      *) die "usage: vanir serialise {write|absorb|remove-user|status|file}" ;;
+    esac
+    ;;
+
+  theme)
+    sub="${1:-status}"
+    shift || true
+
+    case "$sub" in
+      init) theme_init ;;
+      edit) ${EDITOR:-nano} "$THEME_CONFIG" ;;
+      apply)
+        theme_apply
+        theme_enforce
+        ;;
+      enforce|repair)
+        theme_enforce
+        ;;
+      status) theme_status ;;
+      reset) theme_reset ;;
+      *) die "usage: vanir theme {init|edit|apply|status|reset}" ;;
+    esac
+    ;;
+
+  bifrost)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      init) bifrost_init ;;
+      file) bifrost_file ;;
+      edit) bifrost_edit ;;
+      apply) bifrost_apply ;;
+      sync) bifrost_sync ;;
+      integrate) bifrost_integrate ;;
+      channels) bifrost_channels ;;
+      update) bifrost_update ;;
+      search) bifrost_search "$@" ;;
+      install) bifrost_install "$@" ;;
+      remove) bifrost_remove "$@" ;;
+      upgrade) bifrost_upgrade "$@" ;;
+      list) bifrost_list ;;
+      shell) bifrost_shell "$@" ;;
+      run) bifrost_run "$@" ;;
+      gc) bifrost_gc "$@" ;;
+      optimise|optimize) bifrost_optimise ;;
+      *) die "usage: vanir bifrost {init|file|edit|apply|sync|integrate|channels|update|search|install|remove|upgrade|list|shell|run|gc|optimise}" ;;
+    esac   
+    ;;
+
+  record)
+    record "$@"
+    ;;
+
+  core)
+    sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+      integrate) core_integrate ;;
+      *) die "usage: vanir core {integrate}" ;;
+    esac
+    ;;
+
+  help|-h|--help)
+    usage
+    ;;
+
+  *)
+    die "unknown command: $cmd"
+    ;;
+esac
